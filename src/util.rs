@@ -82,13 +82,14 @@ pub(crate) fn release_main_thread() {
 #[allow(unused_macros)]
 macro_rules! borrow {
     ($val:expr) => {{
-        use anyhow::Context;
-        $val.try_borrow().with_context(|| {
-            format!(
-                "[{}:{}] {}",
-                std::file!(),
-                std::line!(),
-                std::stringify!($val)
+        $val.write().map_err(|_| {
+            anyhow::Error::msg(
+                format!(
+                    "[{}:{}] {}",
+                    std::file!(),
+                    std::line!(),
+                    std::stringify!($val)
+                )
             )
         })
     }};
@@ -98,13 +99,14 @@ macro_rules! borrow {
 #[allow(unused_macros)]
 macro_rules! borrow_mut {
     ($val:expr) => {{
-        use anyhow::Context;
-        $val.try_borrow_mut().with_context(|| {
-            format!(
-                "[{}:{}] {}",
-                std::file!(),
-                std::line!(),
-                std::stringify!($val)
+        $val.write().map_err(|_| {
+            anyhow::Error::msg(
+                format!(
+                    "[{}:{}] {}",
+                    std::file!(),
+                    std::line!(),
+                    std::stringify!($val)
+                )
             )
         })
     }};

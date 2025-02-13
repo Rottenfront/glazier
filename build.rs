@@ -41,7 +41,7 @@ fn main() {
         )
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .prepend_enum_name(false)
         .size_t_is_usize(true)
         .allowlist_function("xkb_.*")

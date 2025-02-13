@@ -13,14 +13,15 @@
 
 #![allow(clippy::single_match)]
 
-use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
-use std::rc::{Rc, Weak};
+use std::ptr::{null_mut, NonNull};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, RwLock, Weak};
 
+use flo_binding::{bind, Bound, MutableBound};
 use raw_window_handle::{
-    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
-    WaylandDisplayHandle, WaylandWindowHandle,
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
 use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -56,20 +57,26 @@ use crate::{
     TextFieldToken,
 };
 
+#[derive(Clone, Copy)]
+struct WaylandDisplayInstance(*mut c_void);
+
+unsafe impl Send for WaylandDisplayInstance {}
+unsafe impl Sync for WaylandDisplayInstance {}
+
 #[derive(Clone)]
 pub struct WindowHandle {
     idle_sender: Sender<IdleAction>,
     loop_sender: channel::Sender<ActiveAction>,
-    properties: Weak<RefCell<WindowProperties>>,
+    properties: Option<Arc<RwLock<WindowProperties>>>,
     text: WeakTextInputCell,
     // Safety: Points to a wl_display instance
-    raw_display_handle: Option<*mut c_void>,
+    raw_display_handle: Option<WaylandDisplayInstance>,
 }
 
 impl WindowHandle {
     fn id(&self) -> WindowId {
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         WindowId::new(&props.wayland_window)
     }
 
@@ -79,14 +86,14 @@ impl WindowHandle {
             .expect("Running on a window should only occur whilst application is active")
     }
 
-    fn properties(&self) -> Rc<RefCell<WindowProperties>> {
-        self.properties.upgrade().unwrap()
+    fn properties(&self) -> Arc<RwLock<WindowProperties>> {
+        self.properties.clone().unwrap()
     }
 
     pub fn show(&self) {
         tracing::debug!("show initiated");
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         // TODO: Is this valid?
         props.wayland_window.commit();
     }
@@ -101,7 +108,7 @@ impl WindowHandle {
         tracing::info!("show_titlebar is implemented on a best-effort basis on wayland");
         // TODO: Track this into the fallback decorations when we add those
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         if show_titlebar {
             props
                 .wayland_window
@@ -132,7 +139,8 @@ impl WindowHandle {
 
     pub fn set_size(&self, size: Size) {
         let props = self.properties();
-        props.borrow_mut().requested_size = Some(size);
+        let mut props = props.write().unwrap();
+        props.requested_size = Some(size);
 
         // We don't need to tell the server about changing the size - so long as the size of the surface gets changed properly
         // So, all we need to do is to tell the handler about this change (after caching it here)
@@ -142,13 +150,13 @@ impl WindowHandle {
 
     pub fn get_size(&self) -> Size {
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         props.current_size
     }
 
     pub fn set_window_state(&mut self, state: window::WindowState) {
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         match state {
             crate::WindowState::Maximized => props.wayland_window.set_maximized(),
             crate::WindowState::Minimized => props.wayland_window.set_minimized(),
@@ -180,7 +188,7 @@ impl WindowHandle {
     /// Request a new paint, but without invalidating anything.
     pub fn request_anim_frame(&self) {
         let props = self.properties();
-        let mut props = props.borrow_mut();
+        let mut props = props.write().unwrap();
         props.will_repaint = true;
         if !props.pending_frame_callback {
             drop(props);
@@ -204,7 +212,7 @@ impl WindowHandle {
     }
 
     pub fn remove_text_field(&self, token: TextFieldToken) {
-        let props_cell = self.text.upgrade().unwrap();
+        let props_cell = self.text.clone().unwrap();
         let mut props = props_cell.get();
         let mut updated = false;
         if props.active_text_field.is_some_and(|it| it == token) {
@@ -225,7 +233,7 @@ impl WindowHandle {
     }
 
     pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
-        let props_cell = self.text.upgrade().unwrap();
+        let props_cell = self.text.clone().unwrap();
         let mut props = props_cell.get();
         props.next_text_field = active_field;
         props_cell.set(props);
@@ -234,7 +242,7 @@ impl WindowHandle {
     }
 
     pub fn update_text_field(&self, token: TextFieldToken, update: Event) {
-        let props_cell = self.text.upgrade().unwrap();
+        let props_cell = self.text.clone().unwrap();
         let mut props = props_cell.get();
         if props.active_text_field.is_some_and(|it| it == token) {
             match update {
@@ -248,7 +256,7 @@ impl WindowHandle {
 
     pub fn request_timer(&self, deadline: std::time::Instant) -> TimerToken {
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         let window_id = WindowId::new(&props.wayland_window);
         let token = TimerToken::next();
         props
@@ -298,7 +306,7 @@ impl WindowHandle {
     /// Get the `Scale` of the window.
     pub fn get_scale(&self) -> Result<Scale, ShellError> {
         let props = self.properties();
-        let props = props.borrow();
+        let props = props.read().unwrap();
         Ok(props.current_scale)
     }
 
@@ -311,27 +319,28 @@ impl WindowHandle {
     }
 
     pub fn set_title(&self, title: &str) {
-        let props = self.properties();
-        let props = props.borrow();
+        let props: Arc<RwLock<WindowProperties>> = self.properties();
+        let props = props.read().unwrap();
         props.wayland_window.set_title(title)
     }
-
-    #[cfg(feature = "accesskit")]
-    pub fn update_accesskit_if_active(
-        &self,
-        _update_factory: impl FnOnce() -> accesskit::TreeUpdate,
-    ) {
-        // AccessKit doesn't yet support this backend.
-    }
 }
 
-impl PartialEq for WindowHandle {
-    fn eq(&self, rhs: &Self) -> bool {
-        self.properties.ptr_eq(&rhs.properties)
-    }
-}
+// impl PartialEq for WindowHandle {
+//     fn eq(&self, rhs: &Self) -> bool {
+//         match &self.properties {
+//             None => rhs.properties.is_none(),
+//             Some(props) => {
+//                 if let Some(rprops) = &rhs.properties {
 
-impl Eq for WindowHandle {}
+//                 } else {
+//                     false
+//                 }
+//             }
+//         }
+//     }
+// }
+
+// impl Eq for WindowHandle {}
 
 impl Default for WindowHandle {
     fn default() -> WindowHandle {
@@ -340,31 +349,59 @@ impl Default for WindowHandle {
         let (loop_sender, _) = channel::channel();
         // TODO: Why is this Default?
         WindowHandle {
-            properties: Weak::new(),
+            properties: None,
             raw_display_handle: None,
             idle_sender,
             loop_sender,
-            text: Weak::default(),
+            text: None,
         }
     }
 }
 
-unsafe impl HasRawWindowHandle for WindowHandle {
-    fn raw_window_handle(&self) -> RawWindowHandle {
-        let mut handle = WaylandWindowHandle::empty();
+impl HasWindowHandle for WindowHandle {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         let props = self.properties();
-        handle.surface = props.borrow().wayland_window.wl_surface().id().as_ptr() as *mut _;
-        RawWindowHandle::Wayland(handle)
+        let Some(ptr) = NonNull::new(
+            props
+                .read()
+                .unwrap()
+                .wayland_window
+                .wl_surface()
+                .id()
+                .as_ptr() as *mut _,
+        ) else {
+            return Err(HandleError::Unavailable);
+        };
+        let handle = WaylandWindowHandle::new(ptr);
+        Ok(
+            unsafe {
+                raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::Wayland(handle))
+            },
+        )
     }
 }
 
-unsafe impl HasRawDisplayHandle for WindowHandle {
-    fn raw_display_handle(&self) -> RawDisplayHandle {
-        let mut handle = WaylandDisplayHandle::empty();
-        handle.display = self
-            .raw_display_handle
-            .expect("Window can only be created with a valid display pointer");
-        RawDisplayHandle::Wayland(handle)
+impl HasDisplayHandle for WindowHandle {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        match self.raw_display_handle {
+            Some(WaylandDisplayInstance(ptr)) => {
+                if ptr == null_mut() {
+                    Err(HandleError::Unavailable)
+                } else {
+                    let Some(ptr) = NonNull::new(ptr) else {
+                        return Err(HandleError::Unavailable);
+                    };
+                    let handle = WaylandDisplayHandle::new(ptr);
+                    let handle = RawDisplayHandle::Wayland(handle);
+                    Ok(unsafe { DisplayHandle::borrow_raw(handle) })
+                }
+            }
+            None => Err(HandleError::Unavailable),
+        }
     }
 }
 
@@ -553,21 +590,20 @@ impl WindowBuilder {
             pending_frame_callback: false,
             configured: false,
         };
-        let properties_strong = Rc::new(RefCell::new(properties));
 
-        let properties = Rc::downgrade(&properties_strong);
-        let text = Rc::new(Cell::new(TextInputProperties {
+        let properties = Arc::new(RwLock::new(properties));
+        let text = bind(TextInputProperties {
             active_text_field: None,
             next_text_field: None,
             active_text_field_updated: false,
             active_text_layout_changed: false,
-        }));
+        });
         let handle = WindowHandle {
             idle_sender: self.idle_sender,
             loop_sender: self.loop_sender.clone(),
-            raw_display_handle: Some(self.raw_display_handle),
-            properties,
-            text: Rc::downgrade(&text),
+            raw_display_handle: Some(WaylandDisplayInstance(self.raw_display_handle)),
+            properties: Some(properties.clone()),
+            text: Some(text.clone()),
         };
         // TODO: When should Window::commit be called? This feels fragile
         self.loop_sender
@@ -575,7 +611,7 @@ impl WindowBuilder {
                 window_id,
                 WindowAction::Create(WaylandWindowState {
                     handler: self.handler.unwrap(),
-                    properties: properties_strong,
+                    properties,
                     text_input_seat: None,
                     text,
                     handle: Some(handle.clone()),
@@ -607,7 +643,7 @@ pub(super) struct WaylandWindowState {
     // This helps to make it feasible for surfaces to be dropped before their
     pub handler: Box<dyn WinHandler>,
     // TODO: This refcell is too strong - most of the fields can just be Cells
-    properties: Rc<RefCell<WindowProperties>>,
+    properties: Arc<RwLock<WindowProperties>>,
     text_input_seat: Option<SeatName>,
     pub text: TextInputCell,
     // The handle which will be used to access this window
@@ -648,6 +684,9 @@ struct WindowProperties {
     // We can't draw before being configured
     configured: bool,
 }
+
+unsafe impl Send for WindowProperties {}
+unsafe impl Sync for WindowProperties {}
 
 impl WindowProperties {
     /// Calculate the size that this window should be, given the current configuration
@@ -708,7 +747,7 @@ enum PaintContext {
 impl WaylandWindowState {
     fn do_paint(&mut self, force: bool, context: PaintContext) {
         {
-            let mut props = self.properties.borrow_mut();
+            let mut props = self.properties.write().unwrap();
             if matches!(context, PaintContext::Frame) {
                 props.pending_frame_callback = false;
             }
@@ -738,7 +777,7 @@ impl WaylandWindowState {
         // When forcing, should mark the entire region as damaged
         let mut region = Region::EMPTY;
         {
-            let props = self.properties.borrow();
+            let props = self.properties.write().unwrap();
             let size = props.current_size.to_dp(props.current_scale);
             region.add_rect(Rect {
                 x0: 0.0,
@@ -781,7 +820,7 @@ impl CompositorHandler for WaylandState {
         let scale = Scale::new(factor, factor);
         let new_size;
         {
-            let mut props = window.properties.borrow_mut();
+            let mut props = window.properties.write().unwrap();
             // TODO: Effectively, we need to re-evaluate the size calculation
             // That means we need to cache the WindowConfigure or (mostly) equivalent
             let cur_size_raw: Size = props.current_size.to_px(props.current_scale);
@@ -806,6 +845,36 @@ impl CompositorHandler for WaylandState {
             return;
         };
         window.do_paint(false, PaintContext::Frame);
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &protocol::wl_surface::WlSurface,
+        _new_transform: protocol::wl_output::Transform,
+    ) {
+        // TODO
+    }
+
+    fn surface_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &protocol::wl_surface::WlSurface,
+        _output: &protocol::wl_output::WlOutput,
+    ) {
+        // TODO
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &protocol::wl_surface::WlSurface,
+        _output: &protocol::wl_output::WlOutput,
+    ) {
+        // TODO
     }
 }
 
@@ -845,7 +914,7 @@ impl WindowHandler for WaylandState {
         // TODO: Actually use the suggestions from requested_size
         let display_size;
         {
-            let mut props = window.properties.borrow_mut();
+            let mut props = window.properties.write().unwrap();
             props.configure = Some(configure);
             display_size = props.calculate_size();
             props.configured = true;
@@ -875,7 +944,7 @@ impl WindowAction {
                     return;
                 };
                 let size = {
-                    let mut props = window.properties.borrow_mut();
+                    let mut props = window.properties.write().unwrap();
                     props.calculate_size()
                 };
                 // TODO: Ensure we follow the rules laid out by the compositor in `configure`

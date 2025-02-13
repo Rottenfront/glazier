@@ -18,16 +18,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::mem;
+use std::num::NonZero;
 use std::panic::Location;
 use std::ptr::{null, null_mut};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "accesskit")]
-use accesskit_windows::{Adapter as AccessKitAdapter, UiaInitMarker};
-#[cfg(feature = "accesskit")]
-use once_cell::unsync::OnceCell;
 use scopeguard::defer;
 use tracing::{error, warn};
 use winapi::ctypes::{c_int, c_void};
@@ -43,8 +40,7 @@ use winapi::um::winnt::*;
 use winapi::um::winuser::*;
 
 use raw_window_handle::{
-    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle, Win32WindowHandle,
-    WindowsDisplayHandle,
+    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle
 };
 
 use crate::kurbo::{Insets, Point, Rect, Size, Vec2};
@@ -176,27 +172,43 @@ impl PartialEq for WindowHandle {
 }
 impl Eq for WindowHandle {}
 
-unsafe impl HasRawWindowHandle for WindowHandle {
-    fn raw_window_handle(&self) -> RawWindowHandle {
-        let mut handle = Win32WindowHandle::empty();
+impl HasWindowHandle for WindowHandle {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         if let Some(hwnd) = self.get_hwnd() {
-            handle.hwnd = hwnd as *mut core::ffi::c_void;
+            let mut handle = Win32WindowHandle::new(NonZero::new(hwnd as isize).unwrap());
             handle.hinstance = unsafe {
-                winapi::um::libloaderapi::GetModuleHandleW(0 as LPCWSTR) as *mut core::ffi::c_void
+                NonZero::new(winapi::um::libloaderapi::GetModuleHandleW(0 as LPCWSTR) as isize)
             };
+            unsafe {
+    
+                Ok(raw_window_handle::WindowHandle::borrow_raw(
+                    RawWindowHandle::Win32(handle),
+                ))
+            }
+        } else {
+            // For some reason HWND isn't available
+            Err(raw_window_handle::HandleError::Unavailable)
         }
-        RawWindowHandle::Win32(handle)
+        
     }
 }
 
-unsafe impl HasRawDisplayHandle for WindowHandle {
-    /// See:
-    ///  * <https://github.com/rust-windowing/raw-window-handle/issues/92>
-    ///  * <https://github.com/rust-windowing/winit/blob/92fdf5ba85f920262a61cee4590f4a11ad5738d1/src/platform_impl/windows/window.rs#L285>
-    fn raw_display_handle(&self) -> RawDisplayHandle {
-        RawDisplayHandle::Windows(WindowsDisplayHandle::empty())
+impl HasDisplayHandle for WindowHandle {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        unsafe {
+            Ok(raw_window_handle::DisplayHandle::borrow_raw(
+                RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+            ))
+        }
     }
 }
+unsafe impl Send for WindowHandle {}
+unsafe impl Sync for WindowHandle {}
+
 
 /// A handle that can get used to schedule an idle handler. Note that
 /// this handle is thread safe. If the handle is used after the `hwnd`
@@ -212,11 +224,6 @@ pub struct IdleHandle {
 enum IdleKind {
     Callback(IdleCallback),
     Token(IdleToken),
-}
-
-#[cfg(feature = "accesskit")]
-struct AccessKitActionHandler {
-    idle_handle: IdleHandle,
 }
 
 /// This is the low level window state. All mutable contents are protected
@@ -241,12 +248,6 @@ struct WindowState {
     // False for tooltips, to prevent stealing focus from owner window.
     is_focusable: bool,
     window_level: WindowLevel,
-    #[cfg(feature = "accesskit")]
-    uia_init_marker: UiaInitMarker, // zero size
-    #[cfg(feature = "accesskit")]
-    accesskit_adapter: OnceCell<AccessKitAdapter>,
-    #[cfg(feature = "accesskit")]
-    is_focused: Cell<bool>,
 }
 
 impl std::fmt::Debug for WindowState {
@@ -739,34 +740,10 @@ impl WndProc for MyWndProc {
             WM_ERASEBKGND => Some(0),
             WM_SETFOCUS => {
                 self.with_wnd_state(|s| s.handler.got_focus());
-                #[cfg(feature = "accesskit")]
-                {
-                    let handle = self.handle.borrow();
-                    if let Some(state) = handle.state.upgrade() {
-                        state.is_focused.set(true);
-                        if let Some(adapter) = state.accesskit_adapter.get() {
-                            let events = adapter.update_window_focus_state(true);
-                            drop(handle);
-                            events.raise();
-                        }
-                    }
-                }
                 Some(0)
             }
             WM_KILLFOCUS => {
                 self.with_wnd_state(|s| s.handler.lost_focus());
-                #[cfg(feature = "accesskit")]
-                {
-                    let handle = self.handle.borrow();
-                    if let Some(state) = handle.state.upgrade() {
-                        state.is_focused.set(false);
-                        if let Some(adapter) = state.accesskit_adapter.get() {
-                            let events = adapter.update_window_focus_state(false);
-                            drop(handle);
-                            events.raise();
-                        }
-                    }
-                }
                 Some(0)
             }
             WM_PAINT => unsafe {
@@ -1202,43 +1179,6 @@ impl WndProc for MyWndProc {
                     }
                 })
                 .map(|_| 0),
-            #[cfg(feature = "accesskit")]
-            WM_GETOBJECT => self
-                .handle
-                .borrow()
-                .state
-                .upgrade()
-                .and_then(|state| {
-                    self.with_wnd_state(|s| {
-                        let wparam = accesskit_windows::WPARAM(wparam);
-                        let lparam = accesskit_windows::LPARAM(lparam);
-                        let idle_queue = &state.idle_queue;
-                        let is_focused = state.is_focused.get();
-                        let uia_init_marker = state.uia_init_marker; // zero size and Copy
-                        state
-                            .accesskit_adapter
-                            .get_or_init(move || {
-                                let initial_tree_state = s.handler.accesskit_tree();
-                                let idle_handle = IdleHandle {
-                                    hwnd,
-                                    queue: Arc::clone(idle_queue),
-                                };
-                                let action_handler =
-                                    Box::new(AccessKitActionHandler { idle_handle });
-                                let hwnd = accesskit_windows::HWND(hwnd as _);
-                                AccessKitAdapter::new(
-                                    hwnd,
-                                    initial_tree_state,
-                                    is_focused,
-                                    action_handler,
-                                    uia_init_marker,
-                                )
-                            })
-                            .handle_wm_getobject(wparam, lparam)
-                    })
-                    .flatten()
-                })
-                .map(|result| result.into().0),
             _ => None,
         }
     }
@@ -1415,12 +1355,6 @@ impl WindowBuilder {
                 active_text_input: Cell::new(None),
                 is_focusable: focusable,
                 window_level,
-                #[cfg(feature = "accesskit")]
-                uia_init_marker: UiaInitMarker::new(),
-                #[cfg(feature = "accesskit")]
-                accesskit_adapter: OnceCell::new(),
-                #[cfg(feature = "accesskit")]
-                is_focused: Cell::new(false),
             };
             let win = Rc::new(window);
             let handle = WindowHandle {
@@ -2068,19 +2002,6 @@ impl WindowHandle {
             w.timers.lock().unwrap().free(token);
         }
     }
-
-    #[cfg(feature = "accesskit")]
-    pub fn update_accesskit_if_active(
-        &self,
-        update_factory: impl FnOnce() -> accesskit::TreeUpdate,
-    ) {
-        if let Some(w) = self.state.upgrade() {
-            if let Some(adapter) = w.accesskit_adapter.get() {
-                let events = adapter.update(update_factory());
-                events.raise();
-            }
-        }
-    }
 }
 
 // There is a tiny risk of things going wrong when hwnd is sent across threads.
@@ -2112,14 +2033,5 @@ impl IdleHandle {
             }
         }
         queue.push(IdleKind::Token(token));
-    }
-}
-
-#[cfg(feature = "accesskit")]
-impl accesskit::ActionHandler for AccessKitActionHandler {
-    fn do_action(&mut self, request: accesskit::ActionRequest) {
-        self.idle_handle.add_idle_callback(move |handler| {
-            handler.accesskit_action(request);
-        });
     }
 }

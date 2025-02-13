@@ -1,22 +1,14 @@
-use std::{
-    cell::Cell,
-    collections::HashMap,
-    rc::{Rc, Weak},
+use self::{keyboard::KeyboardState, text_input::InputState};
+use super::{
+    window::{WaylandWindowState, WindowId},
+    WaylandState,
 };
-
 use crate::{
     backend::shared::xkb::{xkb_simulate_input, KeyboardHandled},
     text::InputHandler,
     Counter, TextFieldToken, WinHandler,
 };
-
-use self::{keyboard::KeyboardState, text_input::InputState};
-
-use super::{
-    window::{WaylandWindowState, WindowId},
-    WaylandState,
-};
-
+use flo_binding::{Binding, Bound, MutableBound};
 use keyboard_types::KeyState;
 use smithay_client_toolkit::{
     delegate_seat,
@@ -26,6 +18,7 @@ use smithay_client_toolkit::{
     },
     seat::SeatHandler,
 };
+use std::collections::HashMap;
 
 mod keyboard;
 mod text_input;
@@ -109,7 +102,7 @@ type Windows = HashMap<WindowId, WaylandWindowState>;
 /// in a `Rc<Cell<TextInputProperties>>`, known as
 ///
 /// The contents of this struct are opaque to applications.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(in crate::backend::wayland) struct TextInputProperties {
     pub active_text_field: Option<TextFieldToken>,
     pub next_text_field: Option<TextFieldToken>,
@@ -119,8 +112,8 @@ pub(in crate::backend::wayland) struct TextInputProperties {
     pub active_text_layout_changed: bool,
 }
 
-pub(in crate::backend::wayland) type TextInputCell = Rc<Cell<TextInputProperties>>;
-pub(in crate::backend::wayland) type WeakTextInputCell = Weak<Cell<TextInputProperties>>;
+pub(in crate::backend::wayland) type TextInputCell = Binding<TextInputProperties>;
+pub(in crate::backend::wayland) type WeakTextInputCell = Option<Binding<TextInputProperties>>;
 
 struct FutureInputLock<'a> {
     handler: &'a mut dyn WinHandler,

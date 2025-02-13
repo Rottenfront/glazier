@@ -1,10 +1,9 @@
 use std::any::Any;
-
-#[cfg(feature = "accesskit")]
-use accesskit::TreeUpdate;
+use std::sync::Arc;
 
 use glazier::kurbo::Size;
 use glazier::{Application, IdleToken, Region, Scalable, WinHandler, WindowHandle};
+use wgpu::PipelineCompilationOptions;
 
 const WIDTH: usize = 2048;
 const HEIGHT: usize = 1536;
@@ -12,10 +11,10 @@ const HEIGHT: usize = 1536;
 use std::borrow::Cow;
 
 struct InnerWindowState {
-    window: WindowHandle,
+    window: Arc<WindowHandle>,
     device: wgpu::Device,
     config: wgpu::SurfaceConfiguration,
-    surface: wgpu::Surface,
+    surface: wgpu::Surface<'static>,
     queue: wgpu::Queue,
     render_pipeline: wgpu::RenderPipeline,
 }
@@ -33,7 +32,8 @@ impl InnerWindowState {
     fn create(window: WindowHandle) -> Self {
         let size = surface_size(&window);
         let instance = wgpu::Instance::default();
-        let surface = unsafe { instance.create_surface(&window) }.unwrap();
+        let window = Arc::new(window);
+        let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
@@ -46,10 +46,11 @@ impl InnerWindowState {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                features: wgpu::Features::empty(),
+                required_features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                limits:
+                required_limits:
                     wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+                memory_hints: Default::default(),
             },
             None,
         ))
@@ -75,18 +76,21 @@ impl InnerWindowState {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
+                compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(swapchain_format.into())],
+                compilation_options: PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
 
         let config = wgpu::SurfaceConfiguration {
@@ -97,6 +101,7 @@ impl InnerWindowState {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
+            desired_maximum_frame_latency: 0,
         };
 
         surface.configure(&device, &config);
@@ -185,21 +190,6 @@ impl WinHandler for WindowState {
         let inner = self.inner.as_mut().unwrap();
         inner.draw();
         inner.schedule_render();
-    }
-
-    #[cfg(feature = "accesskit")]
-    fn accesskit_tree(&mut self) -> TreeUpdate {
-        // TODO: Construct a real TreeUpdate
-        use accesskit::{NodeBuilder, NodeClassSet, NodeId, Role, Tree};
-        let builder = NodeBuilder::new(Role::Window);
-        let mut node_classes = NodeClassSet::new();
-        let node = builder.build(&mut node_classes);
-        const WINDOW_ID: NodeId = NodeId(0);
-        TreeUpdate {
-            nodes: vec![(WINDOW_ID, node)],
-            tree: Some(Tree::new(WINDOW_ID)),
-            focus: WINDOW_ID,
-        }
     }
 
     fn idle(&mut self, _: IdleToken) {}

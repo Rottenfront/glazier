@@ -14,14 +14,14 @@
 
 //! X11 implementation of features at the application scope.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::os::unix::io::RawFd;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Error};
+use flo_binding::{Binding, Bound, MutableBound};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::render::{self, ConnectionExt as _, Pictformat};
 use x11rb::protocol::xinput::ChangeReason;
@@ -122,7 +122,7 @@ x11rb::atom_manager! {
 
 #[derive(Clone)]
 pub(crate) struct Application {
-    inner: Rc<AppInner>,
+    inner: Arc<AppInner>,
 }
 
 impl std::ops::Deref for Application {
@@ -133,6 +133,11 @@ impl std::ops::Deref for Application {
     }
 }
 
+// pub(super) struct XCBConnectionInstance(*mut XCBConnection);
+
+// unsafe impl Send for XCBConnectionInstance {}
+// unsafe impl Sync for XCBConnectionInstance {}
+
 #[derive(Debug)]
 pub(crate) struct AppShared {
     /// The connection to the X server.
@@ -142,13 +147,14 @@ pub(crate) struct AppShared {
     ///
     /// A display is a collection of screens.
     pub(super) connection: XCBConnection,
+    // TODO: is this marker even required?
     /// An `XCBConnection` is *technically* safe to use from other threads, but there are
     /// subtleties; see [x11rb event loop integration notes][1] for more details.
     /// Let's just avoid the issue altogether. As far as public API is concerned, this causes
     /// `glazier::WindowHandle` to be `!Send` and `!Sync`.
     ///
     /// [1]: https://github.com/psychon/x11rb/blob/41ab6610f44f5041e112569684fc58cd6d690e57/src/event_loop_integration.rs.
-    pub(super) marker: std::marker::PhantomData<*mut XCBConnection>,
+    // pub(super) marker: std::marker::PhantomData<XCBConnectionInstance>,
 
     /// The default screen of the connected display.
     ///
@@ -163,16 +169,16 @@ pub(crate) struct AppShared {
     pub(super) screen_num: usize, // Needs a container when no longer const
 
     /// Pending events that need to be handled later
-    pub(super) pending_events: RefCell<VecDeque<Event>>,
+    pub(super) pending_events: RwLock<VecDeque<Event>>,
     /// The atoms that we need
     pub(super) atoms: AppAtoms,
     /// Newest timestamp that we received
-    pub(super) timestamp: Cell<Timestamp>,
+    pub(super) timestamp: Binding<Timestamp>,
 }
 
 pub(crate) struct AppInner {
     /// Application state shared with the clipboards
-    shared: Rc<AppShared>,
+    shared: Arc<AppShared>,
 
     /// The type of visual used by the root window
     root_visual_type: Visualtype,
@@ -195,7 +201,7 @@ pub(crate) struct AppInner {
     /// This is constant for the lifetime of the `Application`.
     window_id: u32,
     /// The mutable `Application` state.
-    state: RefCell<State>,
+    state: RwLock<State>,
     /// The read end of the "idle pipe", a pipe that allows the event loop to be woken up from
     /// other threads.
     idle_read: RawFd,
@@ -205,7 +211,7 @@ pub(crate) struct AppInner {
     /// Support for the render extension in at least version 0.5?
     render_argb32_pictformat_cursor: Option<Pictformat>,
     /// The attached input devices, with internal mutability because X events can make them change.
-    pointers: RefCell<PointersState>,
+    pointers: RwLock<PointersState>,
 }
 
 /// The mutable `Application` state.
@@ -213,9 +219,12 @@ struct State {
     /// Whether `Application::quit` has already been called.
     quitting: bool,
     /// A collection of all the `Application` windows.
-    windows: HashMap<u32, Rc<Window>>,
+    windows: HashMap<u32, Arc<Window>>,
     xkb_state: xkb::KeyEventsState,
 }
+
+unsafe impl Send for State {}
+unsafe impl Sync for State {}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Cursors {
@@ -244,7 +253,7 @@ impl Application {
     }
 
     pub fn quit(&self) {
-        if let Ok(mut state) = self.inner.state.try_borrow_mut() {
+        if let Ok(mut state) = self.inner.state.write() {
             if !state.quitting {
                 state.quitting = true;
                 if state.windows.is_empty() {
@@ -277,7 +286,7 @@ impl Application {
 }
 
 impl AppInner {
-    fn new() -> Result<Rc<AppInner>, Error> {
+    fn new() -> Result<Arc<AppInner>, Error> {
         // If we want to support OpenGL, we will need to open a connection with Xlib support (see
         // https://xcb.freedesktop.org/opengl/ for background).  There is some sample code for this
         // in the `rust-xcb` crate (see `connect_with_xlib_display`), although it may be missing
@@ -316,7 +325,7 @@ impl AppInner {
             .state_from_x11_keymap(&keymap, &connection, &device_id)
             .context("State from keymap and device")?;
         let window_id = AppInner::create_event_window(&connection, screen_num)?;
-        let state = RefCell::new(State {
+        let state = RwLock::new(State {
             quitting: false,
             windows: HashMap::new(),
             xkb_state,
@@ -387,21 +396,21 @@ impl AppInner {
             .ok_or_else(|| anyhow!("Couldn't get visual from screen"))?;
         let argb_visual_type = util::get_argb_visual_type(&connection, screen)?;
 
-        let timestamp = Cell::new(x11rb::CURRENT_TIME);
+        let timestamp = Binding::new(x11rb::CURRENT_TIME);
 
-        let shared = Rc::new(AppShared {
+        let shared = Arc::new(AppShared {
             connection,
-            marker: std::marker::PhantomData,
+            // marker: std::marker::PhantomData,
             screen_num,
             pending_events: Default::default(),
             atoms,
             timestamp,
         });
 
-        let clipboard = Clipboard::new(Rc::clone(&shared), atoms.CLIPBOARD);
-        let primary = Clipboard::new(Rc::clone(&shared), atoms.PRIMARY);
+        let clipboard = Clipboard::new(Arc::clone(&shared), atoms.CLIPBOARD);
+        let primary = Clipboard::new(Arc::clone(&shared), atoms.PRIMARY);
 
-        Ok(Rc::new(AppInner {
+        Ok(Arc::new(AppInner {
             shared,
             rdb,
             window_id,
@@ -414,7 +423,7 @@ impl AppInner {
             root_visual_type,
             argb_visual_type,
             render_argb32_pictformat_cursor,
-            pointers: RefCell::new(pointers),
+            pointers: RwLock::new(pointers),
         }))
     }
 
@@ -463,7 +472,7 @@ impl AppInner {
         Ok(id)
     }
 
-    pub(crate) fn add_window(&self, id: u32, window: Rc<Window>) -> Result<(), Error> {
+    pub(crate) fn add_window(&self, id: u32, window: Arc<Window>) -> Result<(), Error> {
         borrow_mut!(self.state)?.windows.insert(id, window);
         Ok(())
     }
@@ -475,7 +484,7 @@ impl AppInner {
         Ok(state.windows.len())
     }
 
-    fn window(&self, id: u32) -> Result<Rc<Window>, Error> {
+    fn window(&self, id: u32) -> Result<Arc<Window>, Error> {
         borrow!(self.state)?
             .windows
             .get(&id)
@@ -517,7 +526,7 @@ impl AppInner {
     }
 
     pub(crate) fn pointer_device(&self, id: u16) -> Option<DeviceInfo> {
-        self.pointers.borrow().device_info(id).cloned()
+        self.pointers.read().unwrap().device_info(id).cloned()
     }
 
     fn reinitialize_pointers(&self) {
@@ -528,7 +537,7 @@ impl AppInner {
         ) {
             // When something changes about the input devices, we just reload the whole pointer configuration.
             // We could be smarter here, but it probably doesn't happen often.
-            Ok(p) => *self.pointers.borrow_mut() = p,
+            Ok(p) => *self.pointers.write().unwrap() = p,
             Err(e) => {
                 tracing::warn!("failed to reload pointers: {e}");
             }
@@ -781,7 +790,7 @@ impl AppInner {
         let mut last_idle_time = Instant::now();
         loop {
             // Figure out when the next wakeup needs to happen
-            let next_timeout = if let Ok(state) = self.state.try_borrow() {
+            let next_timeout = if let Ok(state) = self.state.read() {
                 state
                     .windows
                     .values()
@@ -796,7 +805,7 @@ impl AppInner {
             self.shared.connection.flush()?;
 
             // Deal with pending events
-            let mut event = self.shared.pending_events.borrow_mut().pop_front();
+            let mut event = self.shared.pending_events.write().unwrap().pop_front();
 
             // Before we poll on the connection's file descriptor, check whether there are any
             // events ready. It could be that XCB has some events in its internal buffers because
@@ -832,7 +841,7 @@ impl AppInner {
             let now = Instant::now();
             if let Some(timeout) = next_timeout {
                 if timeout <= now {
-                    if let Ok(state) = self.state.try_borrow() {
+                    if let Ok(state) = self.state.read() {
                         let values = state.windows.values().cloned().collect::<Vec<_>>();
                         drop(state);
                         for w in values {
@@ -847,7 +856,7 @@ impl AppInner {
                 last_idle_time = now;
                 drain_idle_pipe(self.idle_read)?;
 
-                if let Ok(state) = self.state.try_borrow() {
+                if let Ok(state) = self.state.read() {
                     for w in state.windows.values() {
                         w.run_idle();
                     }

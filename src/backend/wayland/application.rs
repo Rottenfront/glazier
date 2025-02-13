@@ -15,22 +15,28 @@
 #![allow(clippy::single_match)]
 
 use std::{
-    cell::RefCell,
     collections::HashMap,
     ffi::c_void,
-    rc::{Rc, Weak},
-    sync::mpsc::{Sender, TryRecvError},
+    ptr::{null_mut, NonNull},
+    sync::{
+        mpsc::{Sender, TryRecvError},
+        Arc, RwLock, Weak,
+    },
 };
 
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, WaylandDisplayHandle,
+};
 use smithay_client_toolkit::{
     compositor::CompositorState,
     output::OutputState,
     reexports::{
         calloop::{channel, EventLoop, LoopHandle, LoopSignal},
+        calloop_wayland_source::WaylandSource,
         client::{
             globals::{registry_queue_init, BindError},
             protocol::wl_compositor,
-            Connection, QueueHandle, WaylandSource,
+            Connection, QueueHandle,
         },
     },
     registry::RegistryState,
@@ -52,7 +58,7 @@ pub struct Application {
     // `State` is the items stored between `new` and `run`
     // It is stored in an Rc<RefCell>> because Application must be Clone
     // The inner is taken in `run`
-    state: Rc<RefCell<Option<WaylandState>>>,
+    state: Arc<RwLock<Option<WaylandState>>>,
     pub(super) compositor: wl_compositor::WlCompositor,
     pub(super) wayland_queue: QueueHandle<WaylandState>,
     pub(super) xdg_shell: Weak<XdgShell>,
@@ -74,8 +80,7 @@ impl Application {
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
 
-        WaylandSource::new(event_queue)
-            .unwrap()
+        WaylandSource::new(conn.clone(), event_queue)
             .insert(loop_handle.clone())
             .unwrap();
 
@@ -100,8 +105,8 @@ impl Application {
         let compositor = compositor_state.wl_compositor().clone();
 
         let (idle_sender, idle_actions) = std::sync::mpsc::channel();
-        let shell = Rc::new(XdgShell::bind(&globals, &qh)?);
-        let shell_ref = Rc::downgrade(&shell);
+        let shell = Arc::new(XdgShell::bind(&globals, &qh)?);
+        let shell_ref = Arc::downgrade(&shell);
         let text_input_global = globals.bind(&qh, 1..=1, TextInputManagerData).map_or_else(
             |err| match err {
                 e @ BindError::UnsupportedVersion => Err(e),
@@ -131,7 +136,7 @@ impl Application {
         };
         state.initial_seats();
         Ok(Application {
-            state: Rc::new(RefCell::new(Some(state))),
+            state: Arc::new(RwLock::new(Some(state))),
             compositor,
             wayland_queue: qh,
             loop_signal,
@@ -147,7 +152,8 @@ impl Application {
         tracing::info!("wayland event loop initiated");
         let mut state = self
             .state
-            .borrow_mut()
+            .write()
+            .unwrap()
             .take()
             .expect("Can only run an application once");
         state.handler = handler;
@@ -190,6 +196,23 @@ impl Application {
         Some(AppHandle {
             loop_sender: self.loop_sender.clone(),
         })
+    }
+}
+
+impl HasDisplayHandle for Application {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        if self.raw_display_handle == null_mut() {
+            Err(HandleError::Unavailable)
+        } else {
+            let Some(ptr) = NonNull::new(self.raw_display_handle) else {
+                return Err(HandleError::Unavailable);
+            };
+            let handle = WaylandDisplayHandle::new(ptr);
+            let handle = RawDisplayHandle::Wayland(handle);
+            Ok(unsafe { DisplayHandle::borrow_raw(handle) })
+        }
     }
 }
 

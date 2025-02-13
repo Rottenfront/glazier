@@ -727,14 +727,6 @@ impl WindowHandle {
             state.canvas.set_title(title)
         }
     }
-
-    #[cfg(feature = "accesskit")]
-    pub fn update_accesskit_if_active(
-        &self,
-        _update_factory: impl FnOnce() -> accesskit::TreeUpdate,
-    ) {
-        // AccessKit doesn't yet support this backend.
-    }
 }
 
 unsafe impl Send for IdleHandle {}

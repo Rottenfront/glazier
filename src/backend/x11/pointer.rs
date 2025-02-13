@@ -22,7 +22,7 @@ pub struct ValuatorInfo {
     pub idx: usize,
     pub min: f64,
     pub max: f64,
-    pub resolution: u32,
+    pub _resolution: u32,
 }
 
 impl ValuatorInfo {
@@ -63,7 +63,7 @@ impl PenValuators {
                     idx: val.number as usize,
                     min: fixed_to_floating(val.min),
                     max: fixed_to_floating(val.max),
-                    resolution: val.resolution,
+                    _resolution: val.resolution,
                 };
                 if val.label == atoms.ABS_PRESSURE && ret.pressure.is_none() {
                     ret.pressure = Some(info);

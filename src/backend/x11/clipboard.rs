@@ -14,11 +14,11 @@
 
 //! Interactions with the system pasteboard on X11.
 
-use std::cell::RefCell;
 use std::convert::TryFrom;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use flo_binding::Bound;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
@@ -46,32 +46,32 @@ const STRING_TARGETS: [&str; 5] = [
 ];
 
 #[derive(Debug, Clone)]
-pub struct Clipboard(Rc<RefCell<ClipboardState>>);
+pub struct Clipboard(Arc<RwLock<ClipboardState>>);
 
 impl Clipboard {
-    pub(crate) fn new(app: Rc<AppShared>, selection_name: Atom) -> Self {
-        Self(Rc::new(RefCell::new(ClipboardState::new(
+    pub(crate) fn new(app: Arc<AppShared>, selection_name: Atom) -> Self {
+        Self(Arc::new(RwLock::new(ClipboardState::new(
             app,
             selection_name,
         ))))
     }
 
     pub(crate) fn handle_clear(&self, event: SelectionClearEvent) -> Result<(), ConnectionError> {
-        self.0.borrow_mut().handle_clear(event)
+        self.0.write().unwrap().handle_clear(event)
     }
 
     pub(crate) fn handle_request(
         &self,
         event: &SelectionRequestEvent,
     ) -> Result<(), ReplyOrIdError> {
-        self.0.borrow_mut().handle_request(event)
+        self.0.write().unwrap().handle_request(event)
     }
 
     pub(crate) fn handle_property_notify(
         &self,
         event: PropertyNotifyEvent,
     ) -> Result<(), ReplyOrIdError> {
-        self.0.borrow_mut().handle_property_notify(event)
+        self.0.write().unwrap().handle_property_notify(event)
     }
 
     pub fn put_string(&mut self, s: impl AsRef<str>) {
@@ -84,38 +84,38 @@ impl Clipboard {
     }
 
     pub fn put_formats(&mut self, formats: &[ClipboardFormat]) {
-        if let Err(err) = self.0.borrow_mut().put_formats(formats) {
+        if let Err(err) = self.0.write().unwrap().put_formats(formats) {
             error!("Error in Clipboard::put_formats: {:?}", err);
         }
     }
 
     pub fn get_string(&self) -> Option<String> {
-        self.0.borrow().get_string()
+        self.0.read().unwrap().get_string()
     }
 
     pub fn preferred_format(&self, formats: &[FormatId]) -> Option<FormatId> {
-        self.0.borrow().preferred_format(formats)
+        self.0.read().unwrap().preferred_format(formats)
     }
 
     pub fn get_format(&self, format: FormatId) -> Option<Vec<u8>> {
-        self.0.borrow().get_format(format)
+        self.0.read().unwrap().get_format(format)
     }
 
     pub fn available_type_names(&self) -> Vec<String> {
-        self.0.borrow().available_type_names()
+        self.0.read().unwrap().available_type_names()
     }
 }
 
 #[derive(Debug)]
 struct ClipboardState {
-    app: Rc<AppShared>,
+    app: Arc<AppShared>,
     selection_name: Atom,
     contents: Option<ClipboardContents>,
     incremental: Vec<IncrementalTransfer>,
 }
 
 impl ClipboardState {
-    fn new(app: Rc<AppShared>, selection_name: Atom) -> Self {
+    fn new(app: Arc<AppShared>, selection_name: Atom) -> Self {
         Self {
             app,
             selection_name,
@@ -264,7 +264,7 @@ impl ClipboardState {
                     // do_transfer()
                     error!("BUG! We are doing a selection transfer while we are the selection owner. This will hang!");
                 }
-                event => self.app.pending_events.borrow_mut().push_back(event),
+                event => self.app.pending_events.write().unwrap().push_back(event),
             }
         };
 
@@ -322,7 +322,7 @@ impl ClipboardState {
                         value.extend_from_slice(&converter(property));
                     }
                 }
-                event => self.app.pending_events.borrow_mut().push_back(event),
+                event => self.app.pending_events.write().unwrap().push_back(event),
             }
         }
     }
@@ -394,7 +394,7 @@ impl ClipboardState {
                         let transfer = IncrementalTransfer::new(
                             conn,
                             event,
-                            Rc::clone(data),
+                            Arc::clone(data),
                             self.app.atoms.INCR,
                         );
                         match transfer {
@@ -464,7 +464,7 @@ impl ClipboardState {
 #[derive(Debug)]
 struct ClipboardContents {
     owner_window: Window,
-    data: Vec<(Atom, String, Rc<[u8]>)>,
+    data: Vec<(Atom, String, Arc<[u8]>)>,
 }
 
 impl ClipboardContents {
@@ -523,7 +523,7 @@ struct IncrementalTransfer {
     requestor: Window,
     target: Atom,
     property: Atom,
-    data: Rc<[u8]>,
+    data: Arc<[u8]>,
     data_offset: usize,
 }
 
@@ -531,7 +531,7 @@ impl IncrementalTransfer {
     fn new(
         conn: &XCBConnection,
         event: &SelectionRequestEvent,
-        data: Rc<[u8]>,
+        data: Arc<[u8]>,
         incr: Atom,
     ) -> Result<Self, ConnectionError> {
         // We need PropertyChange events on the window

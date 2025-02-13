@@ -14,13 +14,13 @@
 
 //! X11 window creation and window management.
 
-use std::cell::{Cell, RefCell};
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
+use std::num::NonZero;
 use std::os::unix::io::RawFd;
 use std::panic::Location;
-use std::rc::{Rc, Weak};
-use std::sync::{Arc, Mutex};
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::backend::shared::xkb::{xkb_simulate_input, KeyEventsState};
@@ -29,6 +29,7 @@ use crate::pointer::{
 };
 use crate::scale::Scalable;
 use anyhow::{anyhow, Context, Error};
+use flo_binding::{Binding, Bound, MutableBound};
 use tracing::{error, warn};
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyOrIdError;
@@ -44,8 +45,8 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::xcb_ffi::XCBConnection;
 
 use raw_window_handle::{
-    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle, XcbDisplayHandle,
-    XcbWindowHandle,
+    DisplayHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    XcbDisplayHandle, XcbWindowHandle,
 };
 
 use crate::backend::shared::Timer;
@@ -237,13 +238,13 @@ impl WindowBuilder {
         };
 
         let (parent, parent_origin) = match &self.level {
-            WindowLevel::AppWindow => (Weak::new(), Vec2::ZERO),
+            WindowLevel::AppWindow => (None, Vec2::ZERO),
             WindowLevel::Tooltip(parent)
             | WindowLevel::DropDown(parent)
             | WindowLevel::Modal(parent) => {
                 let handle = parent.0.unwrap_x11().window.clone();
                 let origin = handle
-                    .upgrade()
+                    .clone()
                     .map(|x| x.get_position())
                     .unwrap_or_default()
                     .to_vec2();
@@ -289,7 +290,7 @@ impl WindowBuilder {
             conn.free_colormap(colormap)?;
         }
 
-        let handler = RefCell::new(self.handler.unwrap());
+        let handler = RwLock::new(self.handler.unwrap());
         // Initialize some properties
         let atoms = self.app.atoms();
         let pid = nix::unistd::Pid::this().as_raw();
@@ -397,21 +398,21 @@ impl WindowBuilder {
             }
         }
 
-        let window = Rc::new(Window {
+        let window = Arc::new(Window {
             id,
             app: self.app.clone(),
             handler,
-            area: Cell::new(ScaledArea::from_px(size_px, scale)),
-            scale: Cell::new(scale),
+            area: Binding::new(ScaledArea::from_px(size_px, scale)),
+            scale: Binding::new(scale),
             min_size,
-            invalid: RefCell::new(Region::EMPTY),
-            destroyed: Cell::new(false),
+            invalid: RwLock::new(Region::EMPTY),
+            destroyed: Binding::new(false),
             timer_queue: Mutex::new(BinaryHeap::new()),
             idle_queue: Arc::new(Mutex::new(Vec::new())),
             idle_pipe: self.app.idle_pipe(),
-            next_text_field: Cell::new(None),
-            active_text_field: Cell::new(None),
-            need_to_reset_compose: Cell::new(false),
+            next_text_field: Binding::new(None),
+            active_text_field: Binding::new(None),
+            need_to_reset_compose: Binding::new(false),
             parent,
         });
 
@@ -420,7 +421,7 @@ impl WindowBuilder {
             window.set_position(pos);
         }
 
-        let handle = WindowHandle::new(id, visual_type.visual_id, Rc::downgrade(&window));
+        let handle = WindowHandle::new(id, visual_type.visual_id, window.clone());
         window.connect(handle.clone())?;
 
         self.app.add_window(id, window)?;
@@ -449,24 +450,24 @@ impl WindowBuilder {
 pub(crate) struct Window {
     id: u32,
     app: Application,
-    handler: RefCell<Box<dyn WinHandler>>,
-    area: Cell<ScaledArea>,
-    scale: Cell<Scale>,
+    handler: RwLock<Box<dyn WinHandler>>,
+    area: Binding<ScaledArea>,
+    scale: Binding<Scale>,
     // min size in px
     min_size: Size,
     /// We've told X11 to destroy this window, so don't so any more X requests with this window id.
-    destroyed: Cell<bool>,
+    destroyed: Binding<bool>,
     /// The region that was invalidated since the last time we rendered.
-    invalid: RefCell<Region>,
+    invalid: RwLock<Region>,
     /// Timers, sorted by "earliest deadline first"
     timer_queue: Mutex<BinaryHeap<Timer<()>>>,
     idle_queue: Arc<Mutex<Vec<IdleKind>>>,
     // Writing to this wakes up the event loop, so that it can run idle handlers.
     idle_pipe: RawFd,
-    next_text_field: Cell<Option<TextFieldToken>>,
-    active_text_field: Cell<Option<TextFieldToken>>,
-    need_to_reset_compose: Cell<bool>,
-    parent: Weak<Window>,
+    next_text_field: Binding<Option<TextFieldToken>>,
+    active_text_field: Binding<Option<TextFieldToken>>,
+    need_to_reset_compose: Binding<bool>,
+    parent: Option<Arc<Window>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -475,10 +476,13 @@ pub struct CustomCursor(xproto::Cursor);
 impl Window {
     #[track_caller]
     fn with_handler<T, F: FnOnce(&mut dyn WinHandler) -> T>(&self, f: F) -> Option<T> {
-        if self.invalid.try_borrow_mut().is_err() {
+        // FIXME: what is that
+        let lock = self.invalid.write();
+        if lock.is_err() {
             error!("other RefCells were borrowed when calling into the handler");
             return None;
         }
+        std::mem::drop(lock);
 
         self.with_handler_and_dont_check_the_other_borrows(f)
     }
@@ -488,7 +492,7 @@ impl Window {
         &self,
         f: F,
     ) -> Option<T> {
-        match self.handler.try_borrow_mut() {
+        match self.handler.write() {
             Ok(mut h) => Some(f(&mut **h)),
             Err(_) => {
                 error!("failed to borrow WinHandler at {}", Location::caller());
@@ -583,7 +587,7 @@ impl Window {
 
     fn parent_origin(&self) -> Vec2 {
         self.parent
-            .upgrade()
+            .clone()
             .map(|x| x.get_position())
             .unwrap_or_default()
             .to_vec2()
@@ -648,7 +652,17 @@ impl Window {
 
     fn add_invalid_rect(&self, rect: Rect) -> Result<(), Error> {
         let scale = self.scale.get();
-        borrow_mut!(self.invalid)?.add_rect(rect.to_px(scale).expand().to_dp(scale));
+        self.invalid
+            .write()
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "[{}:{}] {}",
+                    std::file!(),
+                    std::line!(),
+                    std::stringify!($val)
+                ))
+            })?
+            .add_rect(rect.to_px(scale).expand().to_dp(scale));
         Ok(())
     }
 
@@ -808,7 +822,7 @@ impl Window {
         handler: &mut dyn WinHandler,
     ) -> Option<TextFieldToken> {
         let next_field = self.next_text_field.get();
-        let need_to_reset_compose = self.need_to_reset_compose.take();
+        let need_to_reset_compose = self.need_to_reset_compose.get();
         {
             let previous_field = self.active_text_field.get();
             // In theory, this should be more proactive - but I'm not sure how to implement that
@@ -1250,7 +1264,7 @@ pub(crate) struct WindowHandle {
     id: u32,
     #[allow(dead_code)] // Only used with the raw-win-handle feature
     visual_id: u32,
-    window: Weak<Window>,
+    window: Option<Arc<Window>>,
 }
 impl PartialEq for WindowHandle {
     fn eq(&self, other: &Self) -> bool {
@@ -1260,16 +1274,16 @@ impl PartialEq for WindowHandle {
 impl Eq for WindowHandle {}
 
 impl WindowHandle {
-    fn new(id: u32, visual_id: u32, window: Weak<Window>) -> WindowHandle {
+    fn new(id: u32, visual_id: u32, window: Arc<Window>) -> WindowHandle {
         WindowHandle {
             id,
             visual_id,
-            window,
+            window: Some(window),
         }
     }
 
     pub fn show(&self) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.show();
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1277,7 +1291,7 @@ impl WindowHandle {
     }
 
     pub fn close(&self) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.close();
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1285,7 +1299,7 @@ impl WindowHandle {
     }
 
     pub fn resizable(&self, resizable: bool) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.resizable(resizable);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1293,7 +1307,7 @@ impl WindowHandle {
     }
 
     pub fn show_titlebar(&self, show_titlebar: bool) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.show_titlebar(show_titlebar);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1301,7 +1315,7 @@ impl WindowHandle {
     }
 
     pub fn set_position(&self, position: Point) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.set_position(position);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1309,7 +1323,7 @@ impl WindowHandle {
     }
 
     pub fn get_position(&self) -> Point {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.get_position()
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1323,7 +1337,7 @@ impl WindowHandle {
     }
 
     pub fn set_size(&self, size: Size) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.set_size(size);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1331,7 +1345,7 @@ impl WindowHandle {
     }
 
     pub fn get_size(&self) -> Size {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.size().size_dp()
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1353,7 +1367,7 @@ impl WindowHandle {
     }
 
     pub fn bring_to_front_and_focus(&self) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.bring_to_front_and_focus();
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1361,7 +1375,7 @@ impl WindowHandle {
     }
 
     pub fn request_anim_frame(&self) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.request_anim_frame();
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1369,7 +1383,7 @@ impl WindowHandle {
     }
 
     pub fn invalidate(&self) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.invalidate();
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1377,7 +1391,7 @@ impl WindowHandle {
     }
 
     pub fn invalidate_rect(&self, rect: Rect) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.invalidate_rect(rect);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1385,7 +1399,7 @@ impl WindowHandle {
     }
 
     pub fn set_title(&self, title: &str) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.set_title(title);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1393,7 +1407,7 @@ impl WindowHandle {
     }
 
     pub fn set_menu(&self, menu: Menu) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.set_menu(menu);
         } else {
             error!("Window {} has already been dropped", self.id);
@@ -1405,7 +1419,7 @@ impl WindowHandle {
     }
 
     pub fn remove_text_field(&self, token: TextFieldToken) {
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = &self.window {
             if window.next_text_field.get() == Some(token) {
                 window.next_text_field.set(None);
                 window.need_to_reset_compose.set(true);
@@ -1418,13 +1432,13 @@ impl WindowHandle {
     }
 
     pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = &self.window {
             window.next_text_field.set(active_field);
         }
     }
 
     pub fn update_text_field(&self, token: TextFieldToken, _update: Event) {
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = &self.window {
             // This should be active rather than passive, but since the X11 backend is
             // low-maintenance, this is fine
             if window.active_text_field.get() == Some(token) {
@@ -1436,7 +1450,7 @@ impl WindowHandle {
     }
 
     pub fn request_timer(&self, deadline: Instant) -> TimerToken {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             let timer = Timer::new(deadline, ());
             w.timer_queue.lock().unwrap().push(timer);
             timer.token()
@@ -1446,13 +1460,13 @@ impl WindowHandle {
     }
 
     pub fn set_cursor(&mut self, cursor: &Cursor) {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             w.set_cursor(cursor);
         }
     }
 
     pub fn make_cursor(&self, desc: &CursorDesc) -> Option<Cursor> {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             match w.app.render_argb32_pictformat_cursor() {
                 None => {
                     warn!("Custom cursors are not supported by the X11 server");
@@ -1478,7 +1492,7 @@ impl WindowHandle {
     }
 
     pub fn open_file(&mut self, options: FileDialogOptions) -> Option<FileDialogToken> {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             if let Some(idle) = self.get_idle_handle() {
                 Some(dialog::open_file(w.id, idle, options))
             } else {
@@ -1491,7 +1505,7 @@ impl WindowHandle {
     }
 
     pub fn save_as(&mut self, options: FileDialogOptions) -> Option<FileDialogToken> {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             if let Some(idle) = self.get_idle_handle() {
                 Some(dialog::save_file(w.id, idle, options))
             } else {
@@ -1509,51 +1523,48 @@ impl WindowHandle {
     }
 
     pub fn get_idle_handle(&self) -> Option<IdleHandle> {
-        self.window.upgrade().map(|w| IdleHandle {
+        self.window.as_ref().map(|w| IdleHandle {
             queue: Arc::clone(&w.idle_queue),
             pipe: w.idle_pipe,
         })
     }
 
     pub fn get_scale(&self) -> Result<Scale, ShellError> {
-        if let Some(w) = self.window.upgrade() {
+        if let Some(w) = &self.window {
             Ok(w.get_scale()?)
         } else {
             error!("Window {} has already been dropped", self.id);
             Ok(Scale::new(1.0, 1.0))
         }
     }
+}
 
-    #[cfg(feature = "accesskit")]
-    pub fn update_accesskit_if_active(
+impl HasWindowHandle for WindowHandle {
+    fn window_handle(
         &self,
-        _update_factory: impl FnOnce() -> accesskit::TreeUpdate,
-    ) {
-        // AccessKit doesn't yet support this backend.
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let mut handle = XcbWindowHandle::new(NonZero::new(self.id).unwrap());
+        handle.visual_id = NonZero::new(self.visual_id);
+
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::Xcb(handle)) })
     }
 }
 
-unsafe impl HasRawWindowHandle for WindowHandle {
-    fn raw_window_handle(&self) -> RawWindowHandle {
-        let mut handle = XcbWindowHandle::empty();
-        handle.window = self.id;
-        handle.visual_id = self.visual_id;
-
-        RawWindowHandle::Xcb(handle)
-    }
-}
-
-unsafe impl HasRawDisplayHandle for WindowHandle {
-    fn raw_display_handle(&self) -> RawDisplayHandle {
-        let mut handle = XcbDisplayHandle::empty();
-        if let Some(window) = self.window.upgrade() {
-            handle.connection = window.app.connection().get_raw_xcb_connection();
+impl HasDisplayHandle for WindowHandle {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        if let Some(window) = self.window.clone() {
+            let screen = window.app.screen_num();
+            let connection = window.app.connection().get_raw_xcb_connection();
+            let handle = XcbDisplayHandle::new(NonNull::new(connection), screen as i32);
+            Ok(unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Xcb(handle)) })
         } else {
             // Documentation for HasRawWindowHandle encourages filling in all fields possible,
             // leaving those empty that cannot be derived.
             error!("Failed to get XCBConnection, returning incomplete handle");
+            Err(raw_window_handle::HandleError::Unavailable)
         }
-        RawDisplayHandle::Xcb(handle)
     }
 }
 fn make_cursor(

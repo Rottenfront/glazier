@@ -16,8 +16,10 @@
 
 use std::{
     collections::HashMap,
-    rc::Rc,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc,
+    },
 };
 
 use smithay_client_toolkit::{
@@ -80,7 +82,7 @@ struct WaylandState {
     // It is unused because(?) wgpu creates the surfaces through RawDisplayHandle(?)
     pub _compositor_state: CompositorState,
     // Is used: Keep the XdgShell alive, which is a Weak in all Handles
-    pub _xdg_shell_state: Rc<XdgShell>,
+    pub _xdg_shell_state: Arc<XdgShell>,
     pub wayland_queue: QueueHandle<Self>,
 
     pub event_loop: Option<EventLoop<'static, Self>>,

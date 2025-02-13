@@ -1,9 +1,29 @@
+[workspace]
+resolver = "2"
+members = [".", "examples/*"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.76"
+license = "MIT or Apache 2.0"
+repository = "https://github.com/rottenfront/kreuz"
+
+[workspace.dependencies]
+glazier = { path = "." }
+raw-window-handle = "0.6.2"
+wgpu = { version = "23" }
+
+[workspace.lints]
+clippy.doc_markdown = "warn"
+clippy.semicolon_if_nothing_returned = "warn"
+
 [package]
 name = "glazier"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/linebender/glazier"
+repository = "https://github.com/rottenfront/glazier"
 description = "Cross-platform native API abstraction for building GUI applications."
 keywords = ["gui", "native", "window", "menu", "winit"]
 categories = [
@@ -24,7 +44,7 @@ default-target = "x86_64-pc-windows-msvc"
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 
 [features]
-default = ["x11"]
+default = ["x11", "wayland"]
 x11 = ["ashpd", "bindgen", "futures", "nix", "pkg-config", "x11rb"]
 wayland = [
     # Required for XKBCommon
@@ -35,34 +55,24 @@ wayland = [
     "wayland-backend",
 ]
 
-accesskit = [
-    "dep:accesskit",
-    "accesskit_macos",
-    "accesskit_windows",
-    "once_cell",
-]
-
 [dependencies]
-# Moving forward, this version should align with the kurbo version in peniko.
-kurbo = "0.11.0"
-
+kurbo = "0.11"
 tracing = { version = "0.1.22", features = ["log"] }
 lazy_static = "1.4.0"
 cfg-if = "1.0.0"
 instant = { version = "0.1.6", features = ["wasm-bindgen"] }
 anyhow = "1.0.32"
-keyboard-types = { version = "0.7", default_features = false }
+keyboard-types = { version = "0.7", default-features = false }
 memchr = "2.5"
+flo_binding = "2.2"
 
 # Optional dependencies
-raw-window-handle = { version = "0.5.0", default_features = false }
-accesskit = { version = "0.12.0", optional = true }
+raw-window-handle = { workspace = true }
 once_cell = { version = "1", optional = true }
 
 [target.'cfg(target_os="windows")'.dependencies]
 scopeguard = "1.1.0"
 wio = "0.2.2"
-accesskit_windows = { version = "0.15.0", optional = true }
 once_cell = "1"
 
 [target.'cfg(target_os="windows")'.dependencies.winapi]
@@ -89,19 +99,18 @@ features = [
 
 [target.'cfg(target_os="macos")'.dependencies]
 block = "0.1.6"
-cocoa = "0.25.0"
+cocoa = "0.26"
 objc = "0.2.7"
-core-graphics = "0.23.0"
-bitflags = "2.0.0"
-accesskit_macos = { version = "0.10.0", optional = true }
+core-graphics = "0.24"
+bitflags = "2.6"
 
 [target.'cfg(any(target_os = "freebsd", target_os="linux", target_os="openbsd"))'.dependencies]
-ashpd = { version = "0.5", optional = true }
+ashpd = { version = "0.10.2", optional = true }
 futures = { version = "0.3.24", optional = true, features = ["executor"] }
 
-nix = { version = "0.25.0", optional = true }
+nix = { version = "0.29.0", optional = true }
 
-x11rb = { version = "0.12", features = [
+x11rb = { version = "0.13", features = [
     "allow-unsafe-code",
     "present",
     "render",
@@ -111,28 +120,26 @@ x11rb = { version = "0.12", features = [
     "resource_manager",
     "cursor",
     "xinput",
+    "dri3",
 ], optional = true }
 
 rand = { version = "0.8.0", optional = true }
 log = { version = "0.4.14", optional = true }
 
-smithay-client-toolkit = { version = "0.17.0", optional = true, default-features = false, features = [
+smithay-client-toolkit = { version = "0.19.2", optional = true, default-features = false, features = [
     # Don't use the built-in xkb handling
     "calloop",
 ] }
 # Wayland dependencies
 # Needed for supporting RawWindowHandle
-wayland-backend = { version = "0.1.0", default_features = false, features = [
+wayland-backend = { version = "0.3.7", default-features = false, features = [
     "client_system",
 ], optional = true }
 
 [target.'cfg(target_arch="wasm32")'.dependencies]
 wasm-bindgen = "0.2.67"
 js-sys = "0.3.44"
-
-[target.'cfg(target_arch="wasm32")'.dependencies.web-sys]
-version = "0.3.44"
-features = [
+web-sys = { version = "0.3.44", features = [
     "Window",
     "MouseEvent",
     "CssStyleDeclaration",
@@ -140,29 +147,12 @@ features = [
     "KeyEvent",
     "KeyboardEvent",
     "Navigator",
-]
-
-[dev-dependencies]
-pretty_env_logger = "0.5"
-static_assertions = "1.1.0"
-test-log = { version = "0.2.5", features = ["trace"], default-features = false }
-tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
-unicode-segmentation = "1.7.0"
-vello = { git = "https://github.com/linebender/vello", rev = "b1bd9e361f2944b71cef0ea8a2c71dce5182d79b" }
-parley = { git = "https://github.com/dfrg/parley", rev = "1940d1ae9f2a9b44b7c18967147ffa7d345fdafd" }
-pollster = "0.3.0"
-wgpu = "0.18.0"
+] }
 
 [target.'cfg(any(target_os = "freebsd", target_os="linux", target_os="openbsd"))'.build-dependencies]
-bindgen = { version = "0.66", optional = true }
+bindgen = { version = "0.71", optional = true }
 pkg-config = { version = "0.3.25", optional = true }
 
-[[example]]
-name = "shello"
-# This actually enables scraping for all examples, not just `shello`.
-# However it is possible to add another [[example]] entry to disable it for a specific example.
-doc-scrape-examples = true
-
-[[example]]
-name = "accesskit"
-required-features = ["accesskit"]
+[dev-dependencies]
+static_assertions = "1.1.0"
+test-log = { version = "0.2.5", features = ["trace"], default-features = false }

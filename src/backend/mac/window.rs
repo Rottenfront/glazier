@@ -18,11 +18,10 @@
 
 use std::ffi::c_void;
 use std::mem;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-#[cfg(feature = "accesskit")]
-use accesskit_macos::Adapter as AccessKitAdapter;
 use block::ConcreteBlock;
 use cocoa::appkit::{
     CGFloat, NSApp, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreBuffered, NSColor,
@@ -37,13 +36,11 @@ use objc::declare::ClassDecl;
 use objc::rc::WeakPtr;
 use objc::runtime::{Class, Object, Protocol, Sel};
 use objc::{class, msg_send, sel, sel_impl};
-#[cfg(feature = "accesskit")]
-use once_cell::unsync::OnceCell;
 use tracing::{debug, info};
 
 use raw_window_handle::{
-    AppKitDisplayHandle, AppKitWindowHandle, HasRawDisplayHandle, HasRawWindowHandle,
-    RawDisplayHandle, RawWindowHandle,
+    AppKitDisplayHandle, AppKitWindowHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle,
 };
 
 use crate::kurbo::{Insets, Point, Rect, Size, Vec2};
@@ -160,11 +157,6 @@ pub(crate) struct IdleHandle {
     idle_queue: Weak<Mutex<Vec<IdleKind>>>,
 }
 
-#[cfg(feature = "accesskit")]
-struct AccessKitActionHandler {
-    idle_handle: IdleHandle,
-}
-
 #[derive(Debug)]
 enum DeferredOp {
     SetSize(Size),
@@ -192,10 +184,6 @@ struct ViewState {
     keyboard_state: KeyboardState,
     active_text_input: Option<TextFieldToken>,
     parent: Option<crate::WindowHandle>,
-    #[cfg(feature = "accesskit")]
-    accesskit_adapter: OnceCell<AccessKitAdapter>,
-    #[cfg(feature = "accesskit")]
-    is_focused: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -522,44 +510,6 @@ lazy_static! {
             window_will_close as extern "C" fn(&mut Object, Sel, id),
         );
 
-        #[cfg(feature = "accesskit")]
-        {
-            decl.add_method(
-                sel!(accessibilityChildren),
-                accessibilityChildren as extern "C" fn(&mut Object, Sel) -> id,
-            );
-            extern "C" fn accessibilityChildren(this: &mut Object, _: Sel) -> id {
-                let view_state: *mut c_void = unsafe { *this.get_ivar("viewState") };
-                let view_state = unsafe { &mut *(view_state as *mut ViewState) };
-                let adapter = view_state.get_or_init_accesskit_adapter(this);
-                adapter.view_children() as *mut _
-            }
-            decl.add_method(
-                sel!(accessibilityFocusedUIElement),
-                accessibilityFocusedUIElement as extern "C" fn(&mut Object, Sel) -> id,
-            );
-            extern "C" fn accessibilityFocusedUIElement(this: &mut Object, _: Sel) -> id {
-                let view_state: *mut c_void = unsafe { *this.get_ivar("viewState") };
-                let view_state = unsafe { &mut *(view_state as *mut ViewState) };
-                let adapter = view_state.get_or_init_accesskit_adapter(this);
-                adapter.focus() as *mut _
-            }
-            decl.add_method(
-                sel!(accessibilityHitTest:),
-                accessibilityHitTest as extern "C" fn(&mut Object, Sel, NSPoint) -> id,
-            );
-            extern "C" fn accessibilityHitTest(this: &mut Object, _: Sel, point: NSPoint) -> id {
-                let view_state: *mut c_void = unsafe { *this.get_ivar("viewState") };
-                let view_state = unsafe { &mut *(view_state as *mut ViewState) };
-                let adapter = view_state.get_or_init_accesskit_adapter(this);
-                let point = accesskit_macos::NSPoint {
-                    x: point.x,
-                    y: point.y,
-                };
-                adapter.hit_test(point) as *mut _
-            }
-        }
-
         // methods for NSTextInputClient
         decl.add_method(sel!(hasMarkedText), super::text_input::has_marked_text as extern fn(&mut Object, Sel) -> BOOL);
         decl.add_method(
@@ -650,10 +600,6 @@ fn make_view(handler: Box<dyn WinHandler>) -> (id, Weak<Mutex<Vec<IdleKind>>>) {
             //text: PietText::new_with_unique_state(),
             active_text_input: None,
             parent: None,
-            #[cfg(feature = "accesskit")]
-            accesskit_adapter: OnceCell::new(),
-            #[cfg(feature = "accesskit")]
-            is_focused: false,
         };
         let state_ptr = Box::into_raw(Box::new(state));
         (*view).set_ivar("viewState", state_ptr as *mut c_void);
@@ -1109,14 +1055,6 @@ extern "C" fn window_did_become_key(this: &mut Object, _: Sel, _notification: id
         let view_state: *mut c_void = *this.get_ivar("viewState");
         let view_state = &mut *(view_state as *mut ViewState);
         view_state.handler.got_focus();
-        #[cfg(feature = "accesskit")]
-        {
-            view_state.is_focused = true;
-            if let Some(adapter) = view_state.accesskit_adapter.get() {
-                let events = adapter.update_view_focus_state(true);
-                events.raise();
-            }
-        }
     }
 }
 
@@ -1125,14 +1063,6 @@ extern "C" fn window_did_resign_key(this: &mut Object, _: Sel, _notification: id
         let view_state: *mut c_void = *this.get_ivar("viewState");
         let view_state = &mut *(view_state as *mut ViewState);
         view_state.handler.lost_focus();
-        #[cfg(feature = "accesskit")]
-        {
-            view_state.is_focused = false;
-            if let Some(adapter) = view_state.accesskit_adapter.get() {
-                let events = adapter.update_view_focus_state(false);
-                events.raise();
-            }
-        }
     }
 }
 
@@ -1542,40 +1472,37 @@ impl WindowHandle {
         let scale_factor: CGFloat = unsafe { msg_send![*self.nsview.load(), backingScaleFactor] };
         Ok(Scale::new(scale_factor, scale_factor))
     }
+}
 
-    #[cfg(feature = "accesskit")]
-    pub fn update_accesskit_if_active(
+impl HasWindowHandle for WindowHandle {
+    fn window_handle(
         &self,
-        update_factory: impl FnOnce() -> accesskit::TreeUpdate,
-    ) {
-        let view = self.nsview.load();
-        if let Some(view) = unsafe { (*view).as_ref() } {
-            let view_state: *mut c_void = unsafe { *view.get_ivar("viewState") };
-            let view_state = unsafe { &*(view_state as *const ViewState) };
-            if let Some(adapter) = view_state.accesskit_adapter.get() {
-                let events = adapter.update(update_factory());
-                events.raise();
-            }
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let nsv = self.nsview.load();
+        unsafe {
+            let handle = AppKitWindowHandle::new(NonNull::from(&mut *(*nsv as *mut _)));
+
+            Ok(raw_window_handle::WindowHandle::borrow_raw(
+                RawWindowHandle::AppKit(handle),
+            ))
         }
     }
 }
 
-unsafe impl HasRawWindowHandle for WindowHandle {
-    fn raw_window_handle(&self) -> RawWindowHandle {
-        let nsv = self.nsview.load();
-        let window: id = unsafe { msg_send![*nsv, window] };
-        let mut handle = AppKitWindowHandle::empty();
-        handle.ns_view = *nsv as *mut _;
-        handle.ns_window = window as *mut _;
-        RawWindowHandle::AppKit(handle)
+impl HasDisplayHandle for WindowHandle {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        unsafe {
+            Ok(raw_window_handle::DisplayHandle::borrow_raw(
+                RawDisplayHandle::AppKit(AppKitDisplayHandle::new()),
+            ))
+        }
     }
 }
 
-unsafe impl HasRawDisplayHandle for WindowHandle {
-    fn raw_display_handle(&self) -> RawDisplayHandle {
-        RawDisplayHandle::AppKit(AppKitDisplayHandle::empty())
-    }
-}
+unsafe impl Send for WindowHandle {}
+unsafe impl Sync for WindowHandle {}
 
 unsafe impl Send for IdleHandle {}
 unsafe impl Sync for IdleHandle {}
@@ -1611,49 +1538,6 @@ impl IdleHandle {
 
     pub fn add_idle_token(&self, token: IdleToken) {
         self.add_idle(IdleKind::Token(token));
-    }
-}
-
-#[cfg(feature = "accesskit")]
-impl accesskit::ActionHandler for AccessKitActionHandler {
-    fn do_action(&mut self, request: accesskit::ActionRequest) {
-        self.idle_handle.add_idle_callback(move |handler| {
-            handler.accesskit_action(request);
-        });
-    }
-}
-
-#[cfg(feature = "accesskit")]
-impl ViewState {
-    fn get_or_init_accesskit_adapter(&mut self, view: &mut Object) -> &AccessKitAdapter {
-        // It would be ideal to use `OnceCell::get_or_init` here
-        // for guaranteed atomicity. But that would lead to simultaneous
-        // immutable and mutable borrows of `self`, which aren't allowed.
-        // Since we're using the single-thread version of `OnceCell`,
-        // we know the following won't lead to a race condition.
-        if let Some(adapter) = self.accesskit_adapter.get() {
-            return adapter;
-        }
-        let view = view as *mut Object as *mut c_void;
-        let initial_state = self.handler.accesskit_tree();
-        let is_focused = self.is_focused;
-        let idle_handle = IdleHandle {
-            nsview: self.nsview.clone(),
-            idle_queue: Arc::downgrade(&self.idle_queue),
-        };
-        let action_handler = Box::new(AccessKitActionHandler { idle_handle });
-        // SAFETY: The view pointer is based on a valid borrowed reference
-        // to the view.
-        let adapter =
-            unsafe { AccessKitAdapter::new(view, initial_state, is_focused, action_handler) };
-        match self.accesskit_adapter.try_insert(adapter) {
-            Ok(adapter) => adapter,
-            Err((old_adapter, _)) => {
-                // This would have to be caused by unexpected reentrancy.
-                tracing::warn!("AccessKit adapter unexpectedly set during initialization");
-                old_adapter
-            }
-        }
     }
 }
 

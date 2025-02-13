@@ -1,7 +1,5 @@
 use kurbo::{Insets, Point, Rect, Size};
-use raw_window_handle::{
-    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
-};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::time::Instant;
 
 #[cfg(feature = "wayland")]
@@ -229,7 +227,8 @@ impl IdleHandle {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+// #[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) enum WindowHandle {
     #[cfg(feature = "x11")]
     X11(x11::window::WindowHandle),
@@ -677,41 +676,31 @@ impl WindowHandle {
             WindowHandle::None => panic!("Used an uninitialised WindowHandle"),
         }
     }
+}
 
-    #[cfg(feature = "accesskit")]
-    pub fn update_accesskit_if_active(
+impl HasWindowHandle for WindowHandle {
+    fn window_handle(
         &self,
-        update_factory: impl FnOnce() -> accesskit::TreeUpdate,
-    ) {
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         match self {
             #[cfg(feature = "x11")]
-            WindowHandle::X11(handle) => handle.update_accesskit_if_active(update_factory),
+            WindowHandle::X11(handle) => handle.window_handle(),
             #[cfg(feature = "wayland")]
-            WindowHandle::Wayland(handle) => handle.update_accesskit_if_active(update_factory),
+            WindowHandle::Wayland(handle) => handle.window_handle(),
             WindowHandle::None => panic!("Used an uninitialised WindowHandle"),
         }
     }
 }
 
-unsafe impl HasRawWindowHandle for WindowHandle {
-    fn raw_window_handle(&self) -> RawWindowHandle {
+impl HasDisplayHandle for WindowHandle {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
         match self {
             #[cfg(feature = "x11")]
-            WindowHandle::X11(handle) => handle.raw_window_handle(),
+            WindowHandle::X11(handle) => handle.display_handle(),
             #[cfg(feature = "wayland")]
-            WindowHandle::Wayland(handle) => handle.raw_window_handle(),
-            WindowHandle::None => panic!("Used an uninitialised WindowHandle"),
-        }
-    }
-}
-
-unsafe impl HasRawDisplayHandle for WindowHandle {
-    fn raw_display_handle(&self) -> RawDisplayHandle {
-        match self {
-            #[cfg(feature = "x11")]
-            WindowHandle::X11(handle) => handle.raw_display_handle(),
-            #[cfg(feature = "wayland")]
-            WindowHandle::Wayland(handle) => handle.raw_display_handle(),
+            WindowHandle::Wayland(handle) => handle.display_handle(),
             WindowHandle::None => panic!("Used an uninitialised WindowHandle"),
         }
     }

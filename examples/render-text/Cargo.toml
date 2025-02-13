@@ -1,0 +1,10 @@
+[package]
+name = "render-text"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glazier.workspace = true
+glyphon = { version = "0.7" }
+wgpu.workspace = true
+pollster = "0.3"
